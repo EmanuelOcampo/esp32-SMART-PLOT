@@ -32,14 +32,39 @@
 #endif
 
 // ============== PIN CONFIG (ESP32 WROVER) ==============
-#define RELAY_PIN           5
-#define DHT_PIN             4
-#define SOIL_PIN_1          34   // POT1  (ADC1_CH6, input-only)
-#define SOIL_PIN_2          35   // POT2  (ADC1_CH7, input-only)
-#define SOIL_PIN_3          33   // POT3
-#define SOIL_PIN_4          32   // POT4
+#define SOIL_PIN_1          32   
+#define SOIL_PIN_2          33   
+#define SOIL_PIN_3          14   
+#define SOIL_PIN_4          12   
+#define WATER_LEVEL_PIN     13   
+#define RELAY_PIN           2
+#define DHT_PIN             15
 // BH1750 light sensor on I2C (SDA=21, SCL=22, ADDR→GND = 0x23)
-#define WATER_LEVEL_PIN     39   // ADC1, input-only
+
+// OV3660 on ESP32-WROVER — custom wiring, no conflicts with sensor pins.
+// Avoids sensor GPIOs (4,5,21,22,32,33,34,35,39) and reserved GPIOs (6-11=flash, 16-17=PSRAM).
+//
+// ┌────────────┬────────┬──────────────────────────────────┐
+// │ Camera pin │ GPIO   │ Notes                            │
+// ├────────────┼────────┼──────────────────────────────────┤
+// │ SIOD (SDA) │  26    │ SCCB data  (bidirectional)       │
+// │ SIOC (SCL) │  27    │ SCCB clock (output)              │
+// │ XCLK       │  21    │ Master clock to camera (output)  │
+// │ PCLK       │  22    │ Pixel clock from camera (input)  │
+// │ VSYNC      │  25    │ Vertical sync (input)            │
+// │ HREF       │  23    │ Horizontal ref (input)           │
+// │ D7  (Y9)   │  35    │ Data bit 7 (pull-up at boot OK)  │
+// │ D6  (Y8)   │  34    │ Data bit 6 (RX0, input OK)       │
+// │ D5  (Y7)   │  39    │ Data bit 5 (input-only OK)       │
+// │ D4  (Y6)   │  36    │ Data bit 4                       │
+// │ D3  (Y5)   │  19    │ Data bit 3                       │
+// │ D2  (Y4)   │  18    │ Data bit 2                       │
+// │ D1  (Y3)   │   5    │ Data bit 1 (LOW at boot = OK)    │
+// │ D0  (Y2)   │   4    │ Data bit 0 (keep LOW at boot)    │
+// │ PWDN       │  -1    │ Tie to GND or leave unconnected  │
+// │ RESET      │  -1    │ Tie to 3.3V or leave unconnected │
+// └────────────┴────────┴──────────────────────────────────┘
+//
 
 // ============== AP / WIFI / MQTT ==============
 #define AP_SSID             "ESP32-Plot-Setup"
@@ -48,9 +73,10 @@
 #define MQTT_PUBLISH_INTERVAL_MS   (60 * 1000)   // 1 minute (sensor data)
 #define MQTT_IMAGE_INTERVAL_MS     (60 * 1000)  // 1 minute (image)
 // #define MQTT_IMAGE_INTERVAL_MS     (60 * 60 * 1000)  // 1 hour (image)
-#define MQTT_IMAGE_MAX_SIZE        (32 * 1024)   // max JPEG size for single MQTT message (32 KB)
-#define MQTT_DATA_MAX_SIZE         (52 * 1024)   // max size for /data payload when image (base64) included
-#define LAST_IMAGE_B64_MAX         (45 * 1024)  // cached last image as base64
+
+#define MQTT_IMAGE_MAX_SIZE        (20 * 1024)   // 20KB JPEG
+#define MQTT_DATA_MAX_SIZE         (40 * 1024)   // JSON payload
+#define LAST_IMAGE_B64_MAX         (28 * 1024)   // base64 cache
 
 #define PREF_NAMESPACE       "plotcfg"
 #define PREF_WIFI_SSID       "wifi_ssid"
@@ -129,7 +155,7 @@ void setupPins() {
   pinMode(SOIL_PIN_4, INPUT);
   pinMode(WATER_LEVEL_PIN, INPUT);
   dht.setup(DHT_PIN, DHTesp::DHT11);
-  Wire.begin(21, 22);
+  // Wire.begin(21, 22); // cause of error 
   if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE))
     Serial.println("BH1750 ready");
   else
@@ -444,6 +470,7 @@ size_t buildPlotJson(char* buf, size_t bufSize) {
   JsonArray pots = doc.createNestedArray("pots");
   const char* names[] = { "POT1", "POT2", "POT3", "POT4" };
   int moistures[] = { m1, m2, m3, m4 };
+  // int moistures[] = { m3, m4 };
   for (int i = 0; i < 4; i++) {
     JsonObject p = pots.add<JsonObject>();
     p["name"] = names[i];
@@ -674,30 +701,7 @@ void handleDashboard() {
 
 // ============== CAMERA (hourly image to MQTT) ==============
 #if ENABLE_CAMERA
-// OV3660 on ESP32-WROVER — custom wiring, no conflicts with sensor pins.
-// Avoids sensor GPIOs (4,5,21,22,32,33,34,35,39) and reserved GPIOs (6-11=flash, 16-17=PSRAM).
-//
-// ┌────────────┬────────┬──────────────────────────────────┐
-// │ Camera pin │ GPIO   │ Notes                            │
-// ├────────────┼────────┼──────────────────────────────────┤
-// │ SIOD (SDA) │  26    │ SCCB data  (bidirectional)       │
-// │ SIOC (SCL) │  27    │ SCCB clock (output)              │
-// │ XCLK       │  13    │ Master clock to camera (output)  │
-// │ PCLK       │  15    │ Pixel clock from camera (input)  │
-// │ VSYNC      │  25    │ Vertical sync (input)            │
-// │ HREF       │  23    │ Horizontal ref (input)           │
-// │ D7  (Y9)   │   0    │ Data bit 7 (pull-up at boot OK)  │
-// │ D6  (Y8)   │   3    │ Data bit 6 (RX0, input OK)       │
-// │ D5  (Y7)   │  36    │ Data bit 5 (input-only OK)       │
-// │ D4  (Y6)   │  19    │ Data bit 4                       │
-// │ D3  (Y5)   │  18    │ Data bit 3                       │
-// │ D2  (Y4)   │  14    │ Data bit 2                       │
-// │ D1  (Y3)   │   2    │ Data bit 1 (LOW at boot = OK)    │
-// │ D0  (Y2)   │  12    │ Data bit 0 (keep LOW at boot)    │
-// │ PWDN       │  -1    │ Tie to GND or leave unconnected  │
-// │ RESET      │  -1    │ Tie to 3.3V or leave unconnected │
-// └────────────┴────────┴──────────────────────────────────┘
-// SCCB addresses to probe (7-bit): OV3660=0x3C, OV2640=0x30, OV5640=0x3C
+
 static void sccbScan() {
   Wire1.begin(26, 27, 100000);
   Serial.println("SCCB scan on SDA=26 SCL=27:");
@@ -718,29 +722,29 @@ static camera_config_t buildCameraConfig(int xclk_mhz) {
   camera_config_t cfg = {};
   cfg.pin_pwdn       = -1;
   cfg.pin_reset      = -1;
-  cfg.pin_xclk       = 13;
+  cfg.pin_xclk       = 21;
   cfg.pin_sscb_sda   = 26;
   cfg.pin_sscb_scl   = 27;
-  cfg.pin_d7         = 0;    // Y9
-  cfg.pin_d6         = 3;    // Y8
-  cfg.pin_d5         = 36;   // Y7
-  cfg.pin_d4         = 19;   // Y6
-  cfg.pin_d3         = 18;   // Y5
-  cfg.pin_d2         = 14;   // Y4
-  cfg.pin_d1         = 2;    // Y3
-  cfg.pin_d0         = 12;   // Y2
+  cfg.pin_d7         = 35;    // Y9
+  cfg.pin_d6         = 34;    // Y8
+  cfg.pin_d5         = 39;   // Y7
+  cfg.pin_d4         = 36;   // Y6
+  cfg.pin_d3         = 19;   // Y5
+  cfg.pin_d2         = 18;   // Y4
+  cfg.pin_d1         = 5;    // Y3
+  cfg.pin_d0         = 4;   // Y2
   cfg.pin_vsync      = 25;
   cfg.pin_href       = 23;
-  cfg.pin_pclk       = 15;
+  cfg.pin_pclk       = 22;
   cfg.xclk_freq_hz   = xclk_mhz * 1000000;
   cfg.ledc_timer     = LEDC_TIMER_0;
   cfg.ledc_channel   = LEDC_CHANNEL_0;
   cfg.pixel_format   = PIXFORMAT_JPEG;
   cfg.frame_size     = FRAMESIZE_VGA;
-  cfg.jpeg_quality   = 10;
+  cfg.jpeg_quality   = 20;
   cfg.fb_count       = 2;
   cfg.fb_location    = CAMERA_FB_IN_PSRAM;
-  cfg.grab_mode      = CAMERA_GRAB_WHEN_EMPTY;
+  cfg.grab_mode      = CAMERA_GRAB_LATEST;
   return cfg;
 }
 
@@ -755,7 +759,7 @@ bool initCamera() {
   sccbScan();
 
   // Try 10 MHz first (more reliable for OV3660), fall back to 8 MHz, then 20 MHz
-  const int freqs[] = { 10, 8, 20 };
+  const int freqs[] = { 20 };
   esp_err_t err = ESP_FAIL;
   for (int i = 0; i < 3; i++) {
     Serial.printf("Camera init attempt: XCLK = %d MHz ...\n", freqs[i]);
