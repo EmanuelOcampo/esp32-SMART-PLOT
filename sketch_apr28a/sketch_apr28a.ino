@@ -1,19 +1,20 @@
 /*
  * ESP32 WROVER - 4 Pots + Sensors → WiFi Setup + MQTT (HiveMQ)
  * Sensors: 4× soil moisture, 1× light, 1× water level, 1× DHT (temp/humidity), 1× relay
- * Data published every 1 min: plot id + pots[] (per-pot moisture; shared temp, humidity, waterLevel, lightIntensity)
- * Image published every 1 hour to MQTT (when ENABLE_CAMERA is 1 and camera is connected).
+ * Camera OFF at startup. Each publish cycle (e.g. every 1 min):
+ *   DISCONNECT WIFI → READ SENSORS → CAPTURE IMAGE (offline) → CONNECT WIFI → PUBLISH TO MQTT
+ * Data: plot id + pots[] + optional image (base64) on topic plot/<id>/data.
  *
  * Required libraries (Arduino Library Manager):
  *   - WiFi, WebServer, Preferences (built-in ESP32)
  *   - PubSubClient (by Nick O'Leary)
  *   - ArduinoJson (by Benoit Blanchon)
  *   - DHTesp (by beegee-tokyo) for DHT11 temp/humidity
- *   - BH1750 (by Christopher Laws) for digital light sensor (I2C)
- *   - esp32-camera (built-in with ESP32 board package) for hourly image
+ *   - Keyes KY-018 analog LDR (no library; single analog pin)
+ *   - esp32-camera (built-in with ESP32 board package) for image capture
  */
 
-// Set to 1 to enable hourly image capture and MQTT upload; 0 = no camera.
+// Set to 1 to enable camera in the sequence above; 0 = sensor-only.
 #define ENABLE_CAMERA  1
 // Camera: OV3660 wired to ESP32-WROVER (see pin table in camera section below)
 
@@ -23,8 +24,6 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <DHTesp.h>
-#include <Wire.h>
-#include <BH1750.h>
 #if ENABLE_CAMERA
 #include "esp_camera.h"
 #include "libb64/cencode.h"
@@ -34,12 +33,14 @@
 // ============== PIN CONFIG (ESP32 WROVER) ==============
 #define SOIL_PIN_1          32   
 #define SOIL_PIN_2          33   
-#define SOIL_PIN_3          14   
-#define SOIL_PIN_4          12   
-#define WATER_LEVEL_PIN     13   
-#define RELAY_PIN           2
-#define DHT_PIN             15
-// BH1750 light sensor on I2C (SDA=21, SCL=22, ADDR→GND = 0x23)
+#define SOIL_PIN_3          14   // 4,0,2,22,1,3 
+#define SOIL_PIN_4          12 
+#define WATER_LEVEL_PIN     0   
+#define RELAY_PIN           2  
+#define DHT_PIN             13 // okay
+// Keyes KY-018 LDR: connect AO to this pin; VCC 3.3V, GND. (GPIO 4 = ADC2; 34/35/36/39 = ADC1 but used by camera.)
+#define LIGHT_SENSOR_PIN    15 
+
 
 // OV3660 on ESP32-WROVER — custom wiring, no conflicts with sensor pins.
 // Avoids sensor GPIOs (4,5,21,22,32,33,34,35,39) and reserved GPIOs (6-11=flash, 16-17=PSRAM).
@@ -70,9 +71,8 @@
 #define AP_SSID             "ESP32-Plot-Setup"
 #define AP_PASS             "12345678"
 #define SETUP_PORT          80
-#define MQTT_PUBLISH_INTERVAL_MS   (60 * 1000)   // 1 minute (sensor data)
-#define MQTT_IMAGE_INTERVAL_MS     (60 * 1000)  // 1 minute (image)
-// #define MQTT_IMAGE_INTERVAL_MS     (60 * 60 * 1000)  // 1 hour (image)
+#define MQTT_PUBLISH_INTERVAL_MS   (60 * 1000)   // 1 minute: disconnect -> sensors -> capture -> connect -> publish
+#define WIFI_DISCONNECT_DELAY_MS   5000           // delay after disconnect before reading sensors/camera
 
 #define MQTT_IMAGE_MAX_SIZE        (20 * 1024)   // 20KB JPEG
 #define MQTT_DATA_MAX_SIZE         (40 * 1024)   // JSON payload
@@ -102,8 +102,6 @@ WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
 Preferences prefs;
 DHTesp dht;
-BH1750 lightMeter(0x23);
-
 char prefWifiSsid[64] = "";
 char prefWifiPass[64] = "";
 char prefMqttBroker[128] = "";
@@ -116,27 +114,16 @@ bool wifiConfigured = false;
 bool wifiConnected = false;
 bool relayOn = false;
 unsigned long lastPublishMs = 0;
-unsigned long lastImagePublishMs = 0;
 #if ENABLE_CAMERA
 bool cameraOk = false;
 char cameraError[80] = "";  // last init error message
 static char *lastImageB64 = nullptr;  // allocated from PSRAM to save DRAM
 static size_t lastImageB64Len = 0;
-#define CAMERA_CAPTURE_INTERVAL_MS  8000
-#endif
-unsigned long lastCameraCaptureMs = 0;
-#if ENABLE_CAMERA
-static int cameraFailCount = 0;
-static void tryCameraRecovery() {
-  cameraFailCount++;
-  if (cameraFailCount >= 3) {
-    Serial.println("Camera: reinit after repeated failures");
-    esp_camera_deinit();
-    delay(300);
-    cameraOk = initCamera();
-    cameraFailCount = 0;
-  }
-}
+// Stabilization: first frames can be green/corrupt; delay after init and discard dummy frames
+#define CAMERA_STABILIZE_MS    800   // delay after init before first capture
+#define CAMERA_DUMMY_FRAMES    2     // discard this many frames before keeping one
+#define CAMERA_FRAME_DELAY_MS  150   // delay between frames when discarding
+#define CAMERA_MIN_FRAME_SIZE  2000  // reject frame if smaller (likely bad/green)
 #endif
 
 // ============== SENSOR HELPERS ==============
@@ -154,12 +141,9 @@ void setupPins() {
   pinMode(SOIL_PIN_3, INPUT);
   pinMode(SOIL_PIN_4, INPUT);
   pinMode(WATER_LEVEL_PIN, INPUT);
+  pinMode(LIGHT_SENSOR_PIN , INPUT);
   dht.setup(DHT_PIN, DHTesp::DHT11);
-  // Wire.begin(21, 22); // cause of error 
-  if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE))
-    Serial.println("BH1750 ready");
-  else
-    Serial.println("BH1750 init failed — check wiring (SDA=21, SCL=22, ADDR→GND)");
+  Serial.println("KY-018 light sensor on pin " + String(LIGHT_SENSOR_PIN));
 }
 
 float readTemperature() {
@@ -252,6 +236,15 @@ void sendSetupPage(bool plotIdLocked) {
     .row { display: flex; gap: 8px; align-items: center; }
     .row button { width: auto; flex: 0 0 auto; }
     .row select { flex: 1; }
+    .relay-box { background: #16213e; border-radius: 8px; padding: 12px; margin: 16px 0; display: flex; align-items: center; gap: 12px; border: 1px solid #0f3460; }
+    .relay-box span { font-size: 1rem; }
+    .switch { position: relative; display: inline-block; width: 52px; height: 28px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background: #444; border-radius: 28px; transition: 0.3s; }
+    .slider:before { position: absolute; content: ""; height: 22px; width: 22px; left: 3px; bottom: 3px; background: #fff; border-radius: 50%; transition: 0.3s; }
+    input:checked + .slider { background: #0d7377; }
+    input:checked + .slider:before { transform: translateX(24px); }
+    .relay-status { font-weight: 600; color: #a8e6cf; min-width: 32px; }
   </style>
 </head>
 <body>
@@ -287,6 +280,14 @@ void sendSetupPage(bool plotIdLocked) {
   <form action="/reset" method="POST" onsubmit="return confirm('Clear all config (including Plot ID)?');">
     <button type="submit" class="secondary">Reset configuration</button>
   </form>
+  <div class="relay-box">
+    <span>Relay / Pump:</span>
+    <label class="switch">
+      <input type="checkbox" id="relayToggle">
+      <span class="slider"></span>
+    </label>
+    <span class="relay-status" id="relayStatus">OFF</span>
+  </div>
 )rawliteral";
   html += F("<p class=\"note\"><a href=\"/dashboard\">Live dashboard</a> – current plot data, updates every 20s.</p>");
 #if ENABLE_CAMERA
@@ -321,6 +322,23 @@ void sendSetupPage(bool plotIdLocked) {
     wifiSelect.onchange = function() {
       if (wifiSelect.value) ssidInput.value = wifiSelect.value;
     };
+    var relayToggle = document.getElementById('relayToggle');
+    var relayStatus = document.getElementById('relayStatus');
+    if (relayToggle) {
+      relayToggle.onchange = function() {
+        var st = relayToggle.checked ? 'on' : 'off';
+        fetch('/api/relay?state=' + st, { method: 'POST' })
+          .then(function(r) { return r.json(); })
+          .then(function(d) {
+            relayStatus.textContent = d.relay === 'on' ? 'ON' : 'OFF';
+          })
+          .catch(function() { relayToggle.checked = !relayToggle.checked; });
+      };
+      fetch('/api/relay').then(function(r) { return r.json(); }).then(function(d) {
+        relayToggle.checked = d.relay === 'on';
+        relayStatus.textContent = d.relay === 'on' ? 'ON' : 'OFF';
+      }).catch(function(){});
+    }
   </script>
 </body>
 </html>
@@ -430,12 +448,33 @@ void startAP() {
   WiFi.softAP(AP_SSID, AP_PASS);
   Serial.println("AP started: " + String(AP_SSID) + " IP: " + WiFi.softAPIP().toString());
   setupWebServer();
-#if ENABLE_CAMERA
-  cameraOk = initCamera();  // allow test cam from setup page (192.168.4.1/cam)
-#endif
+  // Camera stays OFF; /cam and /snapshot will init on demand and deinit after
 }
 
 // ============== MQTT ==============
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String relayTopic = String(MQTT_TOPIC_PREFIX) + prefPlotId + "/relay";
+  if (relayTopic != topic) return;
+
+  char msg[16];
+  size_t n = length < (sizeof(msg) - 1) ? length : (sizeof(msg) - 1);
+  memcpy(msg, payload, n);
+  msg[n] = '\0';
+  String s = String(msg);
+  s.trim();
+  s.toLowerCase();
+
+  if (s == "on") {
+    relayOn = true;
+    digitalWrite(RELAY_PIN, HIGH);
+    Serial.println("Relay ON (MQTT)");
+  } else if (s == "off") {
+    relayOn = false;
+    digitalWrite(RELAY_PIN, LOW);
+    Serial.println("Relay OFF (MQTT)");
+  }
+}
+
 void mqttReconnect() {
   if (mqtt.connected()) return;
   mqtt.setServer(prefMqttBroker, prefMqttPort);
@@ -443,9 +482,14 @@ void mqttReconnect() {
     mqtt.connect("ESP32-Plot", prefMqttUser, prefMqttPass);
   else
     mqtt.connect("ESP32-Plot");
-  if (mqtt.connected())
+  if (mqtt.connected()) {
     Serial.println("MQTT connected");
-  else
+    if (strlen(prefPlotId) > 0) {
+      String relayTopic = String(MQTT_TOPIC_PREFIX) + prefPlotId + "/relay";
+      if (mqtt.subscribe(relayTopic.c_str()))
+        Serial.println("Subscribed to " + relayTopic);
+    }
+  } else
     Serial.println("MQTT failed: " + String(mqtt.state()));
 }
 
@@ -456,9 +500,10 @@ size_t buildPlotJson(char* buf, size_t bufSize) {
   if (isnan(temp)) temp = 0.0f;
   if (isnan(hum)) hum = 0.0f;
   int waterLevel = readAnalogPercent(WATER_LEVEL_PIN);
-  float lightLux = lightMeter.readLightLevel();
-  if (lightLux < 0) lightLux = 0;
-  int lightIntensity = (int)round(lightLux);
+  // KY-018 on ADC1: high ADC = dark, low ADC = bright → 0–100% (100 = bright). If yours is reversed, use (0, 4095, 0, 100).
+  int lightRaw = analogRead(LIGHT_SENSOR_PIN);
+  lightRaw = (analogRead(LIGHT_SENSOR_PIN) + lightRaw) / 2;  // quick average
+  int lightIntensity = map(constrain(lightRaw, 0, 4095), 0, 4095, 100, 0);
   int m1 = readAnalogPercent(SOIL_PIN_1);
   int m2 = readAnalogPercent(SOIL_PIN_2);
   int m3 = readAnalogPercent(SOIL_PIN_3);
@@ -467,6 +512,7 @@ size_t buildPlotJson(char* buf, size_t bufSize) {
   StaticJsonDocument<800> doc;
   doc["id"] = prefPlotId;
   doc["ip"] = WiFi.localIP().toString();
+  doc["relay"] = relayOn ? "on" : "off";
   JsonArray pots = doc.createNestedArray("pots");
   const char* names[] = { "POT1", "POT2", "POT3", "POT4" };
   int moistures[] = { m1, m2, m3, m4 };
@@ -484,50 +530,49 @@ size_t buildPlotJson(char* buf, size_t bufSize) {
 }
 
 #if ENABLE_CAMERA
-// Update cached image (base64). Call every 1 min from publishSensorData. Respects capture interval.
-void updateCachedImage() {
-  if (!cameraOk) return;
-  unsigned long now = millis();
-  if (now - lastCameraCaptureMs < CAMERA_CAPTURE_INTERVAL_MS) return;
-  lastCameraCaptureMs = now;
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) {
-    tryCameraRecovery();
+// Camera-only sequence (no WiFi/MQTT): INIT -> CAPTURE -> SAVE AS LAST PICTURE -> TURN OFF.
+// Call while WiFi is disconnected. Saves to lastImageB64 for later publish.
+static void runCameraSequenceOnly() {
+  cameraOk = initCamera();
+  if (!cameraOk) {
+    Serial.println("Camera init failed (offline)");
     return;
   }
-  if (fb->len == 0 || fb->len > 32000) {
-    esp_camera_fb_return(fb);
-    tryCameraRecovery();
+  delay(CAMERA_STABILIZE_MS);
+  for (int i = 0; i < CAMERA_DUMMY_FRAMES; i++) {
+    camera_fb_t *dummy = esp_camera_fb_get();
+    if (dummy) {
+      esp_camera_fb_return(dummy);
+      delay(CAMERA_FRAME_DELAY_MS);
+    }
+  }
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb || fb->len == 0 || fb->len < CAMERA_MIN_FRAME_SIZE || fb->len > 32000) {
+    if (fb) esp_camera_fb_return(fb);
+    esp_camera_deinit();
+    cameraOk = false;
     return;
   }
   size_t b64Len = base64_encode_expected_len(fb->len) + 1;
-  if (b64Len > LAST_IMAGE_B64_MAX) {
-    esp_camera_fb_return(fb);
-    return;
+  if (b64Len <= LAST_IMAGE_B64_MAX) {
+    if (!lastImageB64 && !(lastImageB64 = (char *)heap_caps_malloc(LAST_IMAGE_B64_MAX, MALLOC_CAP_SPIRAM)))
+      lastImageB64 = (char *)heap_caps_malloc(LAST_IMAGE_B64_MAX, MALLOC_CAP_INTERNAL);
+    if (lastImageB64) {
+      int outLen = base64_encode_chars((const char *)fb->buf, fb->len, lastImageB64);
+      lastImageB64[outLen] = '\0';
+      lastImageB64Len = (size_t)outLen;
+    }
   }
-  if (!lastImageB64 && !(lastImageB64 = (char *)heap_caps_malloc(LAST_IMAGE_B64_MAX, MALLOC_CAP_SPIRAM)))
-    lastImageB64 = (char *)heap_caps_malloc(LAST_IMAGE_B64_MAX, MALLOC_CAP_INTERNAL);
-  if (!lastImageB64) {
-    esp_camera_fb_return(fb);
-    return;
-  }
-  int outLen = base64_encode_chars((const char *)fb->buf, fb->len, lastImageB64);
-  lastImageB64[outLen] = '\0';
-  lastImageB64Len = (size_t)outLen;
   esp_camera_fb_return(fb);
-  cameraFailCount = 0;
+  esp_camera_deinit();
+  cameraOk = false;
+  Serial.println("Camera off (offline capture done)");
 }
-#endif
 
-void publishSensorData() {
-  if (strlen(prefPlotId) == 0 || strlen(prefMqttBroker) == 0) return;
-#if ENABLE_CAMERA
-  if (cameraOk) updateCachedImage();
-#endif
-  char buf[800];
-  size_t len = buildPlotJson(buf, sizeof(buf));
-#if ENABLE_CAMERA
-  if (cameraOk && lastImageB64Len > 0 && lastImageB64) {
+// Publish buf (sensor JSON) to MQTT, with lastImageB64 if available. Call when WiFi/MQTT connected.
+static void doPublishToMqtt(const char* buf, size_t len) {
+  String topic = String(MQTT_TOPIC_PREFIX) + prefPlotId + "/data";
+  if (lastImageB64 && lastImageB64Len > 0) {
     DynamicJsonDocument doc(MQTT_DATA_MAX_SIZE);
     if (deserializeJson(doc, buf) == DeserializationError::Ok) {
       doc["image"] = lastImageB64;
@@ -535,22 +580,59 @@ void publishSensorData() {
       if (!pubBuf) pubBuf = (char *)heap_caps_malloc(MQTT_DATA_MAX_SIZE, MALLOC_CAP_INTERNAL);
       if (pubBuf) {
         size_t pubLen = serializeJson(doc, pubBuf, MQTT_DATA_MAX_SIZE);
-        String topic = String(MQTT_TOPIC_PREFIX) + prefPlotId + "/data";
         if (mqtt.publish(topic.c_str(), pubBuf, pubLen))
           Serial.println("Published to " + topic + " (with image)");
         else
           Serial.println("Publish failed");
         heap_caps_free(pubBuf);
+      } else {
+        mqtt.publish(topic.c_str(), buf, len);
       }
-      return;
+    } else {
+      mqtt.publish(topic.c_str(), buf, len);
     }
+  } else {
+    if (mqtt.publish(topic.c_str(), buf, len))
+      Serial.println("Published to " + topic);
+    else
+      Serial.println("Publish failed");
   }
+}
 #endif
+
+// Sequence: DISCONNECT WIFI -> READ SENSORS -> CAPTURE IMAGE (offline) -> CONNECT WIFI -> PUBLISH TO MQTT
+void publishSensorData() {
+  if (strlen(prefPlotId) == 0 || strlen(prefMqttBroker) == 0) return;
+#if ENABLE_CAMERA
+  // 1. Turn WiFi fully OFF so ADC2 is released (WiFi.disconnect() is not enough – ADC2 stays blocked)
+  //    ESP32: ADC2 = GPIO 0,2,4,12,13,14,15,25,26,27; ADC1 = 32,33,34,35,36,39
+  WiFi.disconnect(false);
+  WiFi.mode(WIFI_OFF);
+  delay(WIFI_DISCONNECT_DELAY_MS);
+  Serial.println("WiFi OFF – reading ADC2 sensors and capturing offline");
+#endif
+  // 2. Read sensors (build JSON)
+  char buf[800];
+  size_t len = buildPlotJson(buf, sizeof(buf));
+#if ENABLE_CAMERA
+  // 3. Capture image (camera init -> capture -> save to lastImageB64 -> camera off)
+  runCameraSequenceOnly();
+  // 4. Connect WiFi
+  wifiConnected = tryConnectWifi();
+  if (!wifiConnected) {
+    Serial.println("WiFi reconnect failed – data not published");
+    return;
+  }
+  // 5. Publish to MQTT (sensor + image if captured)
+  mqttReconnect();
+  doPublishToMqtt(buf, len);
+#else
   String topic = String(MQTT_TOPIC_PREFIX) + prefPlotId + "/data";
   if (mqtt.publish(topic.c_str(), buf, len))
     Serial.println("Published to " + topic);
   else
     Serial.println("Publish failed");
+#endif
 }
 
 // API: GET /api/plot returns current sensor data + last cached image (no capture; cache updated every 1 min)
@@ -558,7 +640,7 @@ void handleApiPlot() {
   char buf[800];
   size_t len = buildPlotJson(buf, sizeof(buf));
 #if ENABLE_CAMERA
-  if (cameraOk && lastImageB64Len > 0 && lastImageB64) {
+  if (lastImageB64Len > 0 && lastImageB64) {
     DynamicJsonDocument doc(MQTT_DATA_MAX_SIZE);
     if (deserializeJson(doc, buf) == DeserializationError::Ok) {
       doc["image"] = lastImageB64;
@@ -661,6 +743,10 @@ void handleDashboard() {
       plotIdEl.textContent = fmt(data.id);
       deviceIpEl.textContent = fmt(data.ip);
       lastUpdateEl.textContent = new Date().toLocaleTimeString();
+      if (data.relay !== undefined) {
+        relayToggle.checked = data.relay === 'on';
+        relayStatus.textContent = data.relay === 'on' ? 'ON' : 'OFF';
+      }
       if (data.image) {
         cameraImg.src = 'data:image/jpeg;base64,' + data.image;
         cameraImg.style.display = 'block';
@@ -680,7 +766,7 @@ void handleDashboard() {
           '<div class="row">Temperature: <span class="v">' + fmt(p.temperature) + ' °C</span></div>' +
           '<div class="row">Humidity: <span class="v">' + fmt(p.humidity) + '%</span></div>' +
           '<div class="row">Water level: <span class="v">' + fmt(p.waterLevel) + '%</span></div>' +
-          '<div class="row">Light: <span class="v">' + fmt(p.lightIntensity) + ' lux</span></div>';
+          '<div class="row">Light: <span class="v">' + fmt(p.lightIntensity) + '%</span></div>';
         potsEl.appendChild(card);
       });
     }
@@ -701,22 +787,6 @@ void handleDashboard() {
 
 // ============== CAMERA (hourly image to MQTT) ==============
 #if ENABLE_CAMERA
-
-static void sccbScan() {
-  Wire1.begin(26, 27, 100000);
-  Serial.println("SCCB scan on SDA=26 SCL=27:");
-  int found = 0;
-  for (uint8_t addr = 0x08; addr < 0x78; addr++) {
-    Wire1.beginTransmission(addr);
-    if (Wire1.endTransmission() == 0) {
-      Serial.printf("  Found device at 0x%02X\n", addr);
-      found++;
-    }
-  }
-  if (found == 0)
-    Serial.println("  No devices found — check SDA/SCL wiring and camera power!");
-  Wire1.end();
-}
 
 static camera_config_t buildCameraConfig(int xclk_mhz) {
   camera_config_t cfg = {};
@@ -755,8 +825,6 @@ bool initCamera() {
     strncpy(cameraError, "PSRAM not found", sizeof(cameraError) - 1);
     return false;
   }
-
-  sccbScan();
 
   // Try 10 MHz first (more reliable for OV3660), fall back to 8 MHz, then 20 MHz
   const int freqs[] = { 20 };
@@ -806,81 +874,64 @@ bool initCamera() {
   return true;
 }
 
-void publishImage() {
-  if (strlen(prefPlotId) == 0 || strlen(prefMqttBroker) == 0 || !cameraOk) return;
-
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb || fb->len == 0) {
-    if (fb) esp_camera_fb_return(fb);
-    tryCameraRecovery();
-    Serial.println("Camera capture failed");
-    return;
-  }
-
-  if (fb->len > MQTT_IMAGE_MAX_SIZE) {
-    esp_camera_fb_return(fb);
-    return;
-  }
-
-  cameraFailCount = 0;
-  String topic = String(MQTT_TOPIC_PREFIX) + prefPlotId + "/image";
-  size_t imgLen = fb->len;
-  bool ok = mqtt.publish(topic.c_str(), (const uint8_t *)fb->buf, imgLen, false);
-  esp_camera_fb_return(fb);
-  if (ok)
-    Serial.println("Image published to " + topic + " (" + String(imgLen) + " bytes)");
-  else
-    Serial.println("Image publish failed");
-}
-
-// Web: test camera page and snapshot endpoint
+// Test camera: on "Take snapshot" click -> INIT -> CAPTURE -> send image -> OFF (no camera left on).
 void handleSnapshot() {
+  // 1. Init camera (it is off until we need it)
+  if (!cameraOk)
+    cameraOk = initCamera();
   if (!cameraOk) {
     server.send(503, "text/plain", "Camera not available");
     return;
   }
-  unsigned long now = millis();
-  if (now - lastCameraCaptureMs < CAMERA_CAPTURE_INTERVAL_MS) {
-    server.send(429, "text/plain", "Wait 5s between captures");
-    return;
+  // Let sensor stabilize (reduces green/corrupt first frame)
+  delay(CAMERA_STABILIZE_MS);
+  // Discard dummy frames; first frames are often green or bad
+  for (int i = 0; i < CAMERA_DUMMY_FRAMES; i++) {
+    camera_fb_t *dummy = esp_camera_fb_get();
+    if (dummy) {
+      esp_camera_fb_return(dummy);
+      delay(CAMERA_FRAME_DELAY_MS);
+    }
   }
-  lastCameraCaptureMs = now;
+  // 2. Capture (keep this frame)
   camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb || fb->len == 0) {
+  if (!fb || fb->len == 0 || fb->len < CAMERA_MIN_FRAME_SIZE) {
     if (fb) esp_camera_fb_return(fb);
-    tryCameraRecovery();
-    server.send(503, "text/plain", "Capture failed");
+    esp_camera_deinit();
+    cameraOk = false;
+    server.send(503, "text/plain", "Capture failed or bad frame");
     return;
   }
-  cameraFailCount = 0;
   server.setContentLength(fb->len);
   server.send(200, "image/jpeg", "");
   server.sendContent((const char *)fb->buf, fb->len);
   esp_camera_fb_return(fb);
+  // 3. Turn off camera
+  esp_camera_deinit();
+  cameraOk = false;
 }
 
 void handleTestCam() {
-  if (!cameraOk) {
-    String msg = String("<!DOCTYPE html><html><body><h1>Test camera</h1><p>Camera not available.</p>");
-    if (cameraError[0]) {
-      msg += "<p><strong>Error:</strong> " + String(cameraError) + "</p>";
-      if (strcmp(cameraError, "PSRAM not found") == 0 || strcmp(cameraError, "ESP_FAIL") == 0)
-        msg += "<p class=\"note\"><strong>Fix:</strong> In Arduino IDE set <b>Tools &rarr; PSRAM &rarr; OPI PSRAM</b> (or Enabled), then re-upload.</p>";
-      else if (strcmp(cameraError, "ESP_ERR_NOT_SUPPORTED") == 0)
-        msg += "<p class=\"note\"><strong>Fix (check all):</strong><br>"
-               "1. SIOD &rarr; GPIO 26, SIOC &rarr; GPIO 27<br>"
-               "2. XCLK &rarr; GPIO 13<br>"
-               "3. Camera VCC &rarr; 3.3&thinsp;V, GND &rarr; GND<br>"
-               "4. PWDN pin tied to <b>GND</b> (not floating!)<br>"
-               "5. 4.7k&Omega; pull-ups on SIOD &amp; SIOC to 3.3&thinsp;V<br>"
-               "Open <b>Serial Monitor</b> (115200) for SCCB scan results.</p>";
-      else
-        msg += "<p class=\"note\">Check Serial Monitor (115200) for details.</p>";
-    }
+  // Only show error page (no snapshot button) when init actually failed before
+  if (!cameraOk && cameraError[0]) {
+    String msg = String("<!DOCTYPE html><html><body><h1>Test camera</h1><p><strong>Error:</strong> " + String(cameraError) + "</p>");
+    if (strcmp(cameraError, "PSRAM not found") == 0 || strcmp(cameraError, "ESP_FAIL") == 0)
+      msg += "<p class=\"note\"><strong>Fix:</strong> In Arduino IDE set <b>Tools &rarr; PSRAM &rarr; OPI PSRAM</b> (or Enabled), then re-upload.</p>";
+    else if (strcmp(cameraError, "ESP_ERR_NOT_SUPPORTED") == 0)
+      msg += "<p class=\"note\"><strong>Fix (check all):</strong><br>"
+             "1. SIOD &rarr; GPIO 26, SIOC &rarr; GPIO 27<br>"
+             "2. XCLK &rarr; GPIO 13<br>"
+             "3. Camera VCC &rarr; 3.3&thinsp;V, GND &rarr; GND<br>"
+             "4. PWDN pin tied to <b>GND</b> (not floating!)<br>"
+             "5. 4.7k&Omega; pull-ups on SIOD &amp; SIOC to 3.3&thinsp;V<br>"
+             "Open <b>Serial Monitor</b> (115200) for SCCB scan results.</p>";
+    else
+      msg += "<p class=\"note\">Check Serial Monitor (115200) for details.</p>";
     msg += "<p><a href=\"/cam/retry\">Retry camera init</a> &nbsp; <a href=\"/\">Back to setup</a></p></body></html>";
     server.send(200, "text/html", msg);
     return;
   }
+  // Show snapshot page: click = init -> capture -> off (camera may be off when page loads)
   String html = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -900,6 +951,7 @@ void handleTestCam() {
 </head>
 <body>
   <h1>Test camera</h1>
+  <p class="note">On click: init camera &rarr; capture &rarr; camera off.</p>
   <p><button type="button" id="btn">Take snapshot</button> <a href="/">Back to setup</a></p>
   <p id="status" class="note"></p>
   <img id="preview" alt="Preview" style="display:none;">
@@ -956,14 +1008,14 @@ void setup() {
   }
 
 #if ENABLE_CAMERA
-  cameraOk = initCamera();
+  // Camera stays OFF at startup; init only in sequence: read sensor → init → capture → publish → deinit
   mqtt.setBufferSize(MQTT_DATA_MAX_SIZE);  // large buffer for /data payload with base64 image
 #else
   mqtt.setBufferSize(1024);
 #endif
   mqtt.setServer(prefMqttBroker, prefMqttPort);
+  mqtt.setCallback(mqttCallback);
   lastPublishMs = millis();
-  lastImagePublishMs = millis();
 
   // Start web server on WiFi IP so you can open http://<ESP32_IP>/ and /cam
   setupWebServer();
@@ -982,16 +1034,11 @@ void loop() {
     mqttReconnect();
     if (mqtt.connected() && strlen(prefPlotId) > 0) {
       unsigned long now = millis();
+      // Single interval: disconnect WiFi -> read sensors -> capture (offline) -> connect -> publish MQTT
       if (now - lastPublishMs >= MQTT_PUBLISH_INTERVAL_MS) {
         lastPublishMs = now;
         publishSensorData();
       }
-#if ENABLE_CAMERA
-      if (cameraOk && (now - lastImagePublishMs >= MQTT_IMAGE_INTERVAL_MS)) {
-        lastImagePublishMs = now;
-        publishImage();
-      }
-#endif
     }
   } else {
     server.handleClient();
