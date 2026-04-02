@@ -93,7 +93,7 @@
 
 // Pump: max ON time (manual, MQTT, or auto). Auto starts if average soil moisture is below threshold.
 #define PUMP_MAX_RUN_MS          3000UL   // longest time pump can stay on (3 s)
-#define MOISTURE_LOW_THRESHOLD   35       // average of 4 pots below this (0–100) → auto water
+#define MOISTURE_LOW_THRESHOLD   30       // average of 4 pots below this (0–100) → auto water
 #define PUMP_AUTO_INTERVAL_MS    30000UL // how often to check soil for auto pump (30 s)
 #define PUMP_AUTO_COOLDOWN_MS   (120000UL) // min time after pump stops before another auto start (2 min)
 
