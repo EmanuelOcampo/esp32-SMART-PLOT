@@ -3,6 +3,7 @@
  * Sensors: 4× soil moisture, 1× light, 1× water level, 1× DHT (temp/humidity), 1× relay
  * Camera OFF at startup. Each publish cycle (e.g. every 1 min):
  *   DISCONNECT WIFI → READ SENSORS → CAPTURE IMAGE (offline) → CONNECT WIFI → PUBLISH TO MQTT
+ * Pump: max ON time 3 s (web/MQTT/auto). If average of 4 soil readings < threshold → auto ON (still max 3 s).
  * Data: plot id + pots[] + optional image (base64) on topic plot/<id>/data.
  *
  * Required libraries (Arduino Library Manager):
@@ -90,6 +91,12 @@
 #define MQTT_TOPIC_PREFIX    "plot/"
 #define DEFAULT_MQTT_PORT    1883
 
+// Pump: max ON time (manual, MQTT, or auto). Auto starts if average soil moisture is below threshold.
+#define PUMP_MAX_RUN_MS          3000UL   // longest time pump can stay on (3 s)
+#define MOISTURE_LOW_THRESHOLD   35       // average of 4 pots below this (0–100) → auto water
+#define PUMP_AUTO_INTERVAL_MS    30000UL // how often to check soil for auto pump (30 s)
+#define PUMP_AUTO_COOLDOWN_MS   (120000UL) // min time after pump stops before another auto start (2 min)
+
 // Hardcoded HiveMQ Cloud credentials (not shown on setup page)
 #define HIVEMQ_BROKER        "broker.hivemq.com"
 #define HIVEMQ_PORT          1883
@@ -114,6 +121,9 @@ bool wifiConfigured = false;
 bool wifiConnected = false;
 bool relayOn = false;
 unsigned long lastPublishMs = 0;
+unsigned long pumpOnSinceMs = 0;       // 0 = pump off; else millis() when turned on
+unsigned long lastAutoPumpCheckMs = 0;
+unsigned long lastPumpEndMs = 0;       // for auto cooldown after pump stops
 #if ENABLE_CAMERA
 bool cameraOk = false;
 char cameraError[80] = "";  // last init error message
@@ -152,6 +162,56 @@ float readTemperature() {
 
 float readHumidity() {
   return dht.getHumidity();
+}
+
+// ============== PUMP (max 3 s ON; auto when avg moisture low) ==============
+static void pumpForceOff() {
+  digitalWrite(RELAY_PIN, LOW);
+  relayOn = false;
+  pumpOnSinceMs = 0;
+  lastPumpEndMs = millis();
+}
+
+static void pumpTurnOn() {
+  digitalWrite(RELAY_PIN, HIGH);
+  relayOn = true;
+  pumpOnSinceMs = millis();
+}
+
+// Call often: turns pump off after PUMP_MAX_RUN_MS
+void pumpService() {
+  if (!relayOn || pumpOnSinceMs == 0) return;
+  if (millis() - pumpOnSinceMs >= PUMP_MAX_RUN_MS) {
+    Serial.println("Pump: auto-off (max run time)");
+    pumpForceOff();
+  }
+}
+
+// Use instead of delay() during long work so 3 s pump limit still applies
+static void delayWithPumpService(unsigned long ms) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    pumpService();
+    delay(10);
+  }
+}
+
+static int averageSoilMoisturePercent() {
+  int m1 = readAnalogPercent(SOIL_PIN_1);
+  int m2 = readAnalogPercent(SOIL_PIN_2);
+  int m3 = readAnalogPercent(SOIL_PIN_3);
+  int m4 = readAnalogPercent(SOIL_PIN_4);
+  return (m1 + m2 + m3 + m4) / 4;
+}
+
+static void evaluateAutoPump() {
+  int avg = averageSoilMoisturePercent();
+  if (avg >= MOISTURE_LOW_THRESHOLD) return;
+  if (relayOn) return;
+  unsigned long now = millis();
+  if (lastPumpEndMs != 0 && (now - lastPumpEndMs) < PUMP_AUTO_COOLDOWN_MS) return;
+  Serial.printf("Auto pump: avg moisture %d%% (below %d%%)\n", avg, MOISTURE_LOW_THRESHOLD);
+  pumpTurnOn();
 }
 
 // ============== PREFERENCES ==============
@@ -394,11 +454,9 @@ void handleReset() {
 void handleRelayToggle() {
   String state = server.arg("state");
   if (state == "on") {
-    relayOn = true;
-    digitalWrite(RELAY_PIN, HIGH);
+    pumpTurnOn();
   } else {
-    relayOn = false;
-    digitalWrite(RELAY_PIN, LOW);
+    pumpForceOff();
   }
   server.send(200, "application/json", relayOn ? "{\"relay\":\"on\"}" : "{\"relay\":\"off\"}");
 }
@@ -465,12 +523,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   s.toLowerCase();
 
   if (s == "on") {
-    relayOn = true;
-    digitalWrite(RELAY_PIN, HIGH);
+    pumpTurnOn();
     Serial.println("Relay ON (MQTT)");
   } else if (s == "off") {
-    relayOn = false;
-    digitalWrite(RELAY_PIN, LOW);
+    pumpForceOff();
     Serial.println("Relay OFF (MQTT)");
   }
 }
@@ -538,12 +594,12 @@ static void runCameraSequenceOnly() {
     Serial.println("Camera init failed (offline)");
     return;
   }
-  delay(CAMERA_STABILIZE_MS);
+  delayWithPumpService(CAMERA_STABILIZE_MS);
   for (int i = 0; i < CAMERA_DUMMY_FRAMES; i++) {
     camera_fb_t *dummy = esp_camera_fb_get();
     if (dummy) {
       esp_camera_fb_return(dummy);
-      delay(CAMERA_FRAME_DELAY_MS);
+      delayWithPumpService(CAMERA_FRAME_DELAY_MS);
     }
   }
   camera_fb_t *fb = esp_camera_fb_get();
@@ -608,7 +664,7 @@ void publishSensorData() {
   //    ESP32: ADC2 = GPIO 0,2,4,12,13,14,15,25,26,27; ADC1 = 32,33,34,35,36,39
   WiFi.disconnect(false);
   WiFi.mode(WIFI_OFF);
-  delay(WIFI_DISCONNECT_DELAY_MS);
+  delayWithPumpService(WIFI_DISCONNECT_DELAY_MS);
   Serial.println("WiFi OFF – reading ADC2 sensors and capturing offline");
 #endif
   // 2. Read sensors (build JSON)
@@ -839,7 +895,7 @@ bool initCamera() {
     }
     Serial.printf("  failed: %s (0x%x)\n", esp_err_to_name(err), err);
     esp_camera_deinit();
-    delay(300);
+    delayWithPumpService(300);
   }
 
   if (err != ESP_OK) {
@@ -884,13 +940,13 @@ void handleSnapshot() {
     return;
   }
   // Let sensor stabilize (reduces green/corrupt first frame)
-  delay(CAMERA_STABILIZE_MS);
+  delayWithPumpService(CAMERA_STABILIZE_MS);
   // Discard dummy frames; first frames are often green or bad
   for (int i = 0; i < CAMERA_DUMMY_FRAMES; i++) {
     camera_fb_t *dummy = esp_camera_fb_get();
     if (dummy) {
       esp_camera_fb_return(dummy);
-      delay(CAMERA_FRAME_DELAY_MS);
+      delayWithPumpService(CAMERA_FRAME_DELAY_MS);
     }
   }
   // 2. Capture (keep this frame)
@@ -1023,6 +1079,13 @@ void setup() {
 }
 
 void loop() {
+  pumpService();
+  unsigned long now = millis();
+  if (now - lastAutoPumpCheckMs >= PUMP_AUTO_INTERVAL_MS) {
+    lastAutoPumpCheckMs = now;
+    evaluateAutoPump();
+  }
+
   if (wifiConnected) {
     if (WiFi.status() != WL_CONNECTED) {
       wifiConnected = false;
@@ -1033,10 +1096,9 @@ void loop() {
     mqtt.loop();
     mqttReconnect();
     if (mqtt.connected() && strlen(prefPlotId) > 0) {
-      unsigned long now = millis();
       // Single interval: disconnect WiFi -> read sensors -> capture (offline) -> connect -> publish MQTT
-      if (now - lastPublishMs >= MQTT_PUBLISH_INTERVAL_MS) {
-        lastPublishMs = now;
+      if (millis() - lastPublishMs >= MQTT_PUBLISH_INTERVAL_MS) {
+        lastPublishMs = millis();
         publishSensorData();
       }
     }
